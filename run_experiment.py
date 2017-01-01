@@ -12,7 +12,7 @@ import learners
 import datasets
 
 parser = config.get_options_parser()
-parser.add_argument('--learner', default='Baseline', choices=learners.LEARNERS.keys(),
+parser.add_argument('--learner', default='Seq2Seq', choices=learners.LEARNERS.keys(),
                     help='The name of the model to use in the experiment.')
 parser.add_argument('--load', metavar='MODEL_FILE', default=None,
                     help='If provided, skip training and instead load a pretrained model '
@@ -28,9 +28,10 @@ parser.add_argument('--validation_size', type=int, default=0,
 parser.add_argument('--test_size', type=int, default=None,
                     help='The number of examples to use in testing. '
                          'If None, use the whole dev/test set.')
-parser.add_argument('--data_source', default='foobar_dev', choices=datasets.SOURCES.keys(),
+parser.add_argument('--data_source', default='opensub_dev', choices=datasets.SOURCES.keys(),
                     help='The type of data to use.')
-parser.add_argument('--metrics', default=['accuracy', 'perplexity', 'log_likelihood_bits'],
+parser.add_argument('--metrics', default=['accuracy', 'perplexity', 'log_likelihood_bits',
+                                          'token_perplexity_micro'],
                     choices=metrics.METRICS.keys(),
                     help='The evaluation metrics to report for the experiment.')
 parser.add_argument('--output_train_data', type=config.boolean, default=False,

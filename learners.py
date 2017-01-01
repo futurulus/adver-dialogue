@@ -1,5 +1,4 @@
-# TODO: import all learner models
-from baseline import BaselineLearner
+from seq2seq import Seq2SeqLearner
 
 
 def new(key):
@@ -11,5 +10,5 @@ def new(key):
 
 
 LEARNERS = {
-    'Baseline': BaselineLearner,
+    'Seq2Seq': Seq2SeqLearner,
 }
