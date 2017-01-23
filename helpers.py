@@ -167,3 +167,10 @@ def logit_softmax_nd(axis=1):
         return T.reshape(logits_normalized, logits.shape)
 
     return logit_softmax_fn
+
+
+try:
+    profile = profile
+except NameError:
+    def profile(x):
+        return x

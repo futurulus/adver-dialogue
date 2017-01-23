@@ -75,8 +75,7 @@ class Seq2SeqLearner(NeuralLearner):
 
     def predict(self, eval_instances, random=False, verbosity=0):
         result = []
-        batches = iterators.iter_batches(eval_instances, self.options.eval_batch_size)
-        num_batches = (len(eval_instances) - 1) // self.options.eval_batch_size + 1
+        batches = iterators.gen_batches(eval_instances, self.options.eval_batch_size)
 
         eos_index = self.seq_vec.vectorize(['</s>'])[0]
 
@@ -85,16 +84,16 @@ class Seq2SeqLearner(NeuralLearner):
         if self.options.verbosity + verbosity >= 2:
             print('Predicting')
         if self.options.verbosity + verbosity >= 1:
-            progress.start_task('Predict batch', num_batches)
+            progress.start_task('Predict batch', len(batches))
         for batch_num, batch in enumerate(batches):
             if self.options.verbosity + verbosity >= 1:
                 progress.progress(batch_num)
             batch = list(batch)
 
             if self.options.use_input_mask:
-                (x, xm, _p, mask), (_y,) = self._data_to_arrays(batch, test=True)
+                (x, xm, _p, mask), (_y,) = self.data_to_arrays(batch, test=True)
             else:
-                (x, _p, mask), (_y,) = self._data_to_arrays(batch, test=True)
+                (x, _p, mask), (_y,) = self.data_to_arrays(batch, test=True)
             assert mask.all()  # We shouldn't be masking anything in prediction
 
             beam_size = 1 if random else self.options.beam_size
@@ -136,19 +135,18 @@ class Seq2SeqLearner(NeuralLearner):
 
     def score(self, eval_instances, verbosity=0):
         result = []
-        batches = iterators.iter_batches(eval_instances, self.options.eval_batch_size)
-        num_batches = (len(eval_instances) - 1) // self.options.eval_batch_size + 1
+        batches = iterators.gen_batches(eval_instances, self.options.eval_batch_size)
 
         if self.options.verbosity + verbosity >= 2:
             print('Scoring')
         if self.options.verbosity + verbosity >= 1:
-            progress.start_task('Score batch', num_batches)
+            progress.start_task('Score batch', len(batches))
         for batch_num, batch in enumerate(batches):
             if self.options.verbosity + verbosity >= 1:
                 progress.progress(batch_num)
             batch = list(batch)
 
-            xs, (n,) = self._data_to_arrays(batch, test=False)
+            xs, (n,) = self.data_to_arrays(batch, test=False)
             if self.options.use_input_mask:
                 mask = xs[3]
             else:
@@ -165,21 +163,22 @@ class Seq2SeqLearner(NeuralLearner):
 
         return result
 
-    def _data_to_arrays(self, training_instances, init_vectorizer=False, test=False):
+    def init_vectorizers(self, training_instances):
         tokenize, detokenize = TOKENIZERS[self.options.tokenizer]
+        tokenized = [['<s>'] + tokenize(inst.output) + ['</s>']
+                     for inst in training_instances]
+        self.seq_vec.add_all(tokenized)
+        unk_replaced = self.seq_vec.unk_replace_all(tokenized)
+        config.dump(unk_replaced, 'unk_replaced.train.jsons', lines=True)
 
-        if init_vectorizer:
-            tokenized = [['<s>'] + tokenize(inst.output) + ['</s>']
-                         for inst in training_instances]
-            self.seq_vec.add_all(tokenized)
-            unk_replaced = self.seq_vec.unk_replace_all(tokenized)
-            config.dump(unk_replaced, 'unk_replaced.train.jsons', lines=True)
+    def data_to_arrays(self, training_instances, test=False):
+        tokenize, detokenize = TOKENIZERS[self.options.tokenizer]
 
         inputs = []
         previous = []
         next_tokens = []
         if self.options.verbosity >= 9:
-            print('%s _data_to_arrays:' % self.id)
+            print('%s data_to_arrays:' % self.id)
         maxlen = self.seq_vec.max_len
         for i, inst in enumerate(training_instances):
             x_padded = pad_sequence(tokenize(inst.input), maxlen, left=True, pad='<s>')
@@ -218,7 +217,7 @@ class Seq2SeqLearner(NeuralLearner):
             print('N: %s' % (repr(N),))
         return [X, P, mask], [N]
 
-    def _build_model(self, model_class=SimpleLasagneModel):
+    def build_model(self, model_class=SimpleLasagneModel):
         id_tag = (self.id + '/') if self.id else ''
 
         input_vars = [
@@ -228,13 +227,13 @@ class Seq2SeqLearner(NeuralLearner):
         ]
         target_var = T.imatrix(id_tag + 'targets')
 
-        self.l_out, self.input_layers = self._get_l_out(input_vars)
+        self.l_out, self.input_layers = self.get_l_out(input_vars)
         self.model = model_class(input_vars, [target_var], self.l_out, id=self.id,
                                  loss=self.masked_loss(input_vars),
                                  optimizer=OPTIMIZERS[self.options.optimizer],
                                  learning_rate=self.options.learning_rate)
 
-    def _get_l_out(self, input_vars):
+    def get_l_out(self, input_vars):
         check_options(self.options)
         id_tag = (self.id + '/') if self.id else ''
 
@@ -320,6 +319,15 @@ class Seq2SeqLearner(NeuralLearner):
 
     def sample_prior_smooth(self, num_samples):
         return self.prior_smooth.sample(num_samples)
+
+    '''
+    def __getstate__(self):
+        # TODO: remove unpicklable things?
+        return super(Seq2SeqLearner, self).__getstate__()
+
+    def __setstate__(self, state):
+        return super(Seq2SeqLearner, self).__setstate__(state)
+    '''
 
 
 def check_options(options):

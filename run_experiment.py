@@ -16,13 +16,15 @@ else:
     pick_gpu.bind_theano(options.device)
 
 import datetime
+from itertools import islice
 
 from stanza.monitoring import progress
-from stanza.research import evaluate, output
+from stanza.research import evaluate, output, iterators
 
 import metrics
 import learners
 import datasets
+from helpers import profile
 
 parser = config.get_options_parser()
 parser.add_argument('--learner', default='Seq2Seq', choices=learners.LEARNERS.keys(),
@@ -32,13 +34,13 @@ parser.add_argument('--load', metavar='MODEL_FILE', default=None,
                          'from the specified path. If None or an empty string, train a '
                          'new model.')
 parser.add_argument('--train_size', type=int, default=None,
-                    help='The number of examples to use in training. This number should '
-                         '*include* examples held out for validation. If None, use the '
+                    help='The number of examples to use in training. If None, use the '
                          'whole training set.')
-parser.add_argument('--validation_size', type=int, default=0,
-                    help='The number of examples to hold out from the training set for '
-                         'monitoring generalization error.')
-parser.add_argument('--test_size', type=int, default=None,
+parser.add_argument('--validation_size', type=int, default=None,
+                    help="The number of examples to use in validation. If None, use the "
+                         "whole validation set. If 0 (or if the data_source doesn't have "
+                         "a validation set), validation will be skipped.")
+parser.add_argument('--eval_size', type=int, default=None,
                     help='The number of examples to use in testing. '
                          'If None, use the whole dev/test set.')
 parser.add_argument('--data_source', default='opensub_dev', choices=datasets.SOURCES.keys(),
@@ -50,28 +52,36 @@ parser.add_argument('--metrics', default=['accuracy', 'perplexity', 'log_likelih
 parser.add_argument('--output_train_data', type=config.boolean, default=False,
                     help='If True, write out the training dataset (after cutting down to '
                          '`train_size`) as a JSON-lines file in the output directory.')
-parser.add_argument('--output_test_data', type=config.boolean, default=False,
+parser.add_argument('--output_eval_data', type=config.boolean, default=False,
                     help='If True, write out the evaluation dataset (after cutting down to '
-                         '`test_size`) as a JSON-lines file in the output directory.')
+                         '`eval_size`) as a JSON-lines file in the output directory.')
 parser.add_argument('--progress_tick', type=int, default=10,
                     help='The number of seconds between logging progress updates.')
 
 
+@profile
 def main():
     options = config.options()
 
     progress.set_resolution(datetime.timedelta(seconds=options.progress_tick))
 
-    train_data = datasets.SOURCES[options.data_source].train_data()[:options.train_size]
-    if options.validation_size:
-        assert options.validation_size < len(train_data), \
-            ('No training data after validation split! (%d <= %d)' %
-             (len(train_data), options.validation_size))
-        validation_data = train_data[-options.validation_size:]
-        train_data = train_data[:-options.validation_size]
-    else:
-        validation_data = None
-    test_data = datasets.SOURCES[options.data_source].test_data()[:options.test_size]
+    source = datasets.SOURCES[options.data_source]
+    SG = iterators.SizedGenerator
+
+    train_data = SG(lambda: islice(source.train_data(), 0, options.train_size), length=None)
+    if not hasattr(options, 'verbosity') or options.verbosity >= 4:
+        print('Training set size: {}'.format(len(train_data)))
+
+    validation_data = None
+    if source.validation_data is not None:
+        validation_data = SG(lambda: islice(source.validation_data(), 0, options.train_size),
+                             length=None)
+        if not hasattr(options, 'verbosity') or options.verbosity >= 4:
+            print('Validation set size: {}'.format(len(validation_data)))
+
+    eval_data = SG(lambda: islice(source.eval_data(), 0, options.train_size), length=None)
+    if not hasattr(options, 'verbosity') or options.verbosity >= 4:
+        print('Eval set size: {}'.format(len(eval_data)))
 
     learner = learners.new(options.learner)
 
@@ -91,9 +101,9 @@ def main():
                                           write_data=options.output_train_data)
         output.output_results(train_results, 'train')
 
-    test_results = evaluate.evaluate(learner, test_data, metrics=m, split_id='eval',
-                                     write_data=options.output_test_data)
-    output.output_results(test_results, 'eval')
+    eval_results = evaluate.evaluate(learner, eval_data, metrics=m, split_id='eval',
+                                     write_data=options.output_eval_data)
+    output.output_results(eval_results, 'eval')
 
 
 if __name__ == '__main__':

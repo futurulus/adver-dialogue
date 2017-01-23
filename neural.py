@@ -13,9 +13,9 @@ from lasagne.updates import total_norm_constraint
 from theano.compile import MonitorMode
 from theano.printing import pydotprint
 
-from helpers import apply_nan_suppression
+from helpers import apply_nan_suppression, profile
 from stanza.monitoring import progress, summary
-from stanza.research import config
+from stanza.research import config, iterators
 from stanza.research.learner import Learner
 from stanza.research.rng import get_rng
 
@@ -144,8 +144,7 @@ class SimpleLasagneModel(object):
 
         params = self.params()
         (monitored,
-         train_loss_grads,
-         synth_vars) = self.get_train_loss(target_vars, params)
+         train_loss_grads) = self.get_train_loss(target_vars, params)
         self.monitored_tags = monitored.keys()
 
         if self.options.grad_clipping:
@@ -167,7 +166,7 @@ class SimpleLasagneModel(object):
 
         if self.options.verbosity >= 2:
             print(id_tag_log + 'Compiling training function')
-        params = input_vars + target_vars + synth_vars
+        params = input_vars + target_vars
         if self.options.verbosity >= 6:
             print('params = %s' % (params,))
         self.train_fn = theano.function(params, monitored.values(),
@@ -212,13 +211,10 @@ class SimpleLasagneModel(object):
         if self.options.monitor_activations:
             for name, layer in get_named_layers(self.l_out).iteritems():
                 monitored.append(('activation/' + name, get_output(layer)))
-        return OrderedDict(monitored), grads, []
+        return OrderedDict(monitored), grads
 
-    def fit(self, Xs, ys, batch_size, num_epochs, summary_writer=None, step=0):
-        if not isinstance(Xs, Sequence):
-            raise ValueError('Xs should be a sequence, instead got %s' % (Xs,))
-        if not isinstance(ys, Sequence):
-            raise ValueError('ys should be a sequence, instead got %s' % (ys,))
+    @profile
+    def fit(self, minibatches, num_epochs, summary_writer=None, step=0):
         history = OrderedDict((tag, []) for tag in self.monitored_tags)
         id_tag = (self.id + '/') if self.id else ''
         params = self.params()
@@ -228,16 +224,17 @@ class SimpleLasagneModel(object):
         for epoch in range(num_epochs):
             progress.progress(epoch)
             history_epoch = OrderedDict((tag, []) for tag in self.monitored_tags)
-            num_minibatches_approx = len(ys[0]) // batch_size + 1
+            num_examples = 0
 
-            progress.start_task('Minibatch', num_minibatches_approx)
-            for i, batch in enumerate(self.minibatches(Xs, ys, batch_size, shuffle=True)):
+            progress.start_task('Minibatch', len(minibatches))
+            for i, batch in enumerate(minibatches):
                 progress.progress(i)
                 if self.options.verbosity >= 8:
                     print('types: %s' % ([type(v) for t in batch for v in t],))
                     print('shapes: %s' % ([v.shape for t in batch for v in t],))
-                inputs, targets, synth = batch
-                monitored = self.train_fn(*inputs + targets + synth)
+                inputs, targets = batch
+                num_examples += targets[0].shape[0]
+                monitored = self.train_fn(*inputs + targets)
                 for tag, value in zip(self.monitored_tags, monitored):
                     if self.options.verbosity >= 10:
                         print('%s: %s' % (tag, value))
@@ -263,7 +260,7 @@ class SimpleLasagneModel(object):
                         summary_writer.log_histogram(step + epoch, tag, val)
 
             epoch_end = time.time()
-            examples_per_sec = len(ys[0]) / (epoch_end - epoch_start)
+            examples_per_sec = num_examples / (epoch_end - epoch_start)
             summary_writer.log_scalar(step + epoch,
                                       id_tag + 'examples_per_sec', examples_per_sec)
             epoch_start = epoch_end
@@ -279,28 +276,10 @@ class SimpleLasagneModel(object):
             print(id_tag_log + 'predict shapes: %s' % [x.shape for x in Xs])
         return self.predict_fn(*Xs)
 
-    def minibatches(self, inputs, targets, batch_size, shuffle=False):
-        '''Lifted mostly verbatim from iterate_minibatches in
-        https://github.com/Lasagne/Lasagne/blob/master/examples/mnist.py'''
-        num_examples = len(targets[0])
-        assert all(len(X) == num_examples for X in inputs), \
-            repr([type(X) for X in inputs] + [type(y) for y in targets])
-        assert all(len(y) == num_examples for y in targets), \
-            repr([type(X) for X in inputs] + [type(y) for y in targets])
-        if shuffle:
-            indices = np.arange(num_examples)
-            rng.shuffle(indices)
-        last_batch = max(0, num_examples - batch_size)
-        for start_idx in range(0, last_batch + 1, batch_size):
-            if shuffle:
-                excerpt = indices[start_idx:start_idx + batch_size]
-            else:
-                excerpt = slice(start_idx, start_idx + batch_size)
-            yield [X[excerpt] for X in inputs], [y[excerpt] for y in targets], []
-
     def __getstate__(self):
         state = dict(self.__dict__)
         state['loss'] = Unpicklable('loss')
+        state['optimizer'] = Unpicklable('optimizer')
         state['l_out'] = Unpicklable('l_out')
         return state
 
@@ -361,20 +340,20 @@ class NeuralLearner(Learner):
         self.id = id
         self.get_options()
 
+    @profile
     def train(self, training_instances, validation_instances=None, metrics=None,
               keep_params=False):
         id_tag = (self.id + ': ') if self.id else ''
 
-        self.dataset = training_instances
-        xs, ys = self._data_to_arrays(training_instances,
-                                      init_vectorizer=not hasattr(self, 'model'))
+        if not hasattr(self, 'model'):
+            self.init_vectorizers(training_instances)
         if not hasattr(self, 'model') or not keep_params:
             if self.options.verbosity >= 2:
                 print(id_tag + 'Building model')
             if keep_params:
                 warnings.warn("keep_params was passed, but the model hasn't been built; "
                               "initializing all parameters.")
-            self._build_model()
+            self.build_model()
         else:
             if not hasattr(self.options, 'reset_optimizer_vars') or \
                     self.options.reset_optimizer_vars:
@@ -397,10 +376,13 @@ class NeuralLearner(Learner):
         if not hasattr(self, 'step_base'):
             self.step_base = 0
 
+        minibatches = iterators.sized_imap(self.data_to_arrays,
+                                           iterators.gen_batches(training_instances,
+                                                                 self.options.batch_size))
         progress.start_task('Iteration', self.options.train_iters)
         for iteration in range(self.options.train_iters):
             progress.progress(iteration)
-            self.model.fit(xs, ys, batch_size=self.options.batch_size,
+            self.model.fit(minibatches,  # batch_size=self.options.batch_size,
                            num_epochs=self.options.train_epochs,
                            summary_writer=writer,
                            step=self.step_base + iteration * self.options.train_epochs)
@@ -443,25 +425,26 @@ class NeuralLearner(Learner):
     def __getstate__(self):
         if not hasattr(self, 'model'):
             raise RuntimeError("trying to pickle a model that hasn't been built yet")
-        params = self.params()
-        # TODO: remove references to the vectorizer from this superclass
-        state = (self.seq_vec, [p.get_value() for p in params], self.id)
+        state = dict(self.__dict__)
+        state['params_state'] = [p.get_value() for p in self.params()]
+        state['model'] = Unpicklable('model')
+        state['l_out'] = Unpicklable('l_out')
+        state['input_layers'] = Unpicklable('input_layers')
         return state
 
     def __setstate__(self, state):
         self.unpickle(state)
 
     def unpickle(self, state, model_class=SimpleLasagneModel):
-        if isinstance(state, dict) and 'quickpickle' in state and state['quickpickle']:
-            self.__dict__.update(state)
-            self.get_options()
-            return
-
+        self.__dict__.update(state)
         self.get_options()
 
-        # TODO: remove references to the vectorizer from this superclass
-        (self.seq_vec, params_state, self.id) = state
-        self._build_model(model_class)
+        if 'quickpickle' in state and state['quickpickle']:
+            return
+
+        params_state = state['params_state']
+        del self.params_state
+        self.build_model(model_class)
         params = self.params()
         assert len(params) == len(params_state), '%d != %d' % (len(params), len(params_state))
         for p, value in zip(params, params_state):
@@ -471,3 +454,23 @@ class NeuralLearner(Learner):
         if not hasattr(self, 'options'):
             options = config.options()
             self.options = argparse.Namespace(**options.__dict__)
+
+    def init_vectorizers(self, training_instances):
+        '''
+        Receives the entire training set. Override in subclasses to set up vocab indices, etc.
+        '''
+        pass
+
+    def data_to_arrays(self, instances, test=False):
+        '''
+        Actually perform vectorization. Implement in subclasses.
+        '''
+        raise NotImplementedError
+
+    def build_model(self, model_class=SimpleLasagneModel):
+        '''
+        Override in subclasses to specify the model structure. Should set `self.model`
+        (an instance of `model_class`), `self.l_out` (a layer object of the NN library),
+        and `self.input_layers` (a sequence of layer objects).
+        '''
+        raise NotImplementedError
