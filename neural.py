@@ -273,6 +273,7 @@ class SimpleLasagneModel(object):
 
                     history_end = time.time()
                     examples_per_sec = num_examples / (history_end - history_start)
+                    num_examples = 0
                     summary_writer.log_scalar(step + step_offset,
                                               id_tag + 'examples_per_sec', examples_per_sec)
                     history_start = history_end
