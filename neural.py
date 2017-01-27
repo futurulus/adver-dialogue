@@ -42,6 +42,12 @@ parser.add_argument('--graphviz', type=config.boolean, default=False,
                          'function graphs.')
 parser.add_argument('--nan_suppression', type=config.boolean, default=True,
                     help='If `True`, try to suppress NaNs in training.')
+parser.add_argument('--validation_period', type=int, default=10000,
+                    help='Number of minibatches to wait between running validation. Use 0 to '
+                         'validate only at the end of every iteration. (Note: setting '
+                         'validation_size to 0 disables validation.)')
+parser.add_argument('--monitor_period', type=int, default=100,
+                    help='Number of minibatches to wait between logging monitored tensors.')
 parser.add_argument('--monitor_grads', type=config.boolean, default=False,
                     help='If `True`, return gradients for monitoring and write them to the '
                          'TensorBoard events file.')
@@ -123,7 +129,8 @@ class Unpicklable(object):
 
 class SimpleLasagneModel(object):
     def __init__(self, input_vars, target_vars, l_out, loss,
-                 optimizer, learning_rate=0.001, id=None):
+                 optimizer, learning_rate=0.001,
+                 monitor_period=1, validation_period=1, id=None):
         if not isinstance(input_vars, Sequence):
             raise ValueError('input_vars should be a sequence, instead got %s' % (input_vars,))
         if not isinstance(target_vars, Sequence):
@@ -136,6 +143,8 @@ class SimpleLasagneModel(object):
         self.loss = loss
         self.optimizer = optimizer
         self.id = id
+        self.monitor_period = monitor_period
+        self.validation_period = validation_period
         id_tag = (self.id + '/') if self.id else ''
         id_tag_log = (self.id + ': ') if self.id else ''
 
@@ -214,18 +223,21 @@ class SimpleLasagneModel(object):
         return OrderedDict(monitored), grads
 
     @profile
-    def fit(self, minibatches, num_epochs, summary_writer=None, step=0):
+    def fit(self, minibatches, num_epochs, summary_writer=None, step=0,
+            validate_fn=lambda i: None):
         history = OrderedDict((tag, []) for tag in self.monitored_tags)
         id_tag = (self.id + '/') if self.id else ''
         params = self.params()
+        step_offset = 0
+        num_examples = 0
+        time_history = 0
+        history_start = time.time()
 
         progress.start_task('Epoch', num_epochs)
-        epoch_start = time.time()
         for epoch in range(num_epochs):
             progress.progress(epoch)
-            history_epoch = OrderedDict((tag, []) for tag in self.monitored_tags)
-            num_examples = 0
 
+            history_batch = OrderedDict((tag, []) for tag in self.monitored_tags)
             progress.start_task('Minibatch', len(minibatches))
             for i, batch in enumerate(minibatches):
                 progress.progress(i)
@@ -238,35 +250,44 @@ class SimpleLasagneModel(object):
                 for tag, value in zip(self.monitored_tags, monitored):
                     if self.options.verbosity >= 10:
                         print('%s: %s' % (tag, value))
-                    history_epoch[tag].append(value)
+                    history_batch[tag].append(value)
+
+                if (step_offset + 1) % self.monitor_period == 0:
+                    for tag, values in history_batch.items():
+                        values_array = np.array([np.asarray(v) for v in values])
+                        history[tag].append(values_array)
+                        mean_values = np.mean(values_array, axis=0)
+                        if len(mean_values.shape) == 0:
+                            summary_writer.log_scalar(step + step_offset, tag, mean_values)
+                        else:
+                            summary_writer.log_histogram(step + step_offset, tag, mean_values)
+
+                    if self.options.monitor_params:
+                        for param in params:
+                            val = param.get_value()
+                            tag = 'param/' + param.name
+                            if len(val.shape) == 0:
+                                summary_writer.log_scalar(step + step_offset, tag, val)
+                            else:
+                                summary_writer.log_histogram(step + step_offset, tag, val)
+
+                    history_end = time.time()
+                    examples_per_sec = num_examples / (history_end - history_start)
+                    summary_writer.log_scalar(step + step_offset,
+                                              id_tag + 'examples_per_sec', examples_per_sec)
+                    history_start = history_end
+
+                if self.validation_period and (step_offset + 1) % self.validation_period == 0:
+                    validate_iter = (step_offset + 1) / self.validation_period
+                    validate_fn(validate_iter)
+
+                step_offset += 1
             progress.end_task()
-
-            for tag, values in history_epoch.items():
-                values_array = np.array([np.asarray(v) for v in values])
-                history[tag].append(values_array)
-                mean_values = np.mean(values_array, axis=0)
-                if len(mean_values.shape) == 0:
-                    summary_writer.log_scalar(step + epoch, tag, mean_values)
-                else:
-                    summary_writer.log_histogram(step + epoch, tag, mean_values)
-
-            if self.options.monitor_params:
-                for param in params:
-                    val = param.get_value()
-                    tag = 'param/' + param.name
-                    if len(val.shape) == 0:
-                        summary_writer.log_scalar(step + epoch, tag, val)
-                    else:
-                        summary_writer.log_histogram(step + epoch, tag, val)
-
-            epoch_end = time.time()
-            examples_per_sec = num_examples / (epoch_end - epoch_start)
-            summary_writer.log_scalar(step + epoch,
-                                      id_tag + 'examples_per_sec', examples_per_sec)
-            epoch_start = epoch_end
         progress.end_task()
 
-        return history
+        if not self.validation_period:
+            validate_iter = step / step_offset
+            validate_fn(validate_iter)
 
     def predict(self, Xs):
         if not isinstance(Xs, Sequence):
@@ -385,18 +406,23 @@ class NeuralLearner(Learner):
             self.model.fit(minibatches,  # batch_size=self.options.batch_size,
                            num_epochs=self.options.train_epochs,
                            summary_writer=writer,
-                           step=self.step_base + iteration * self.options.train_epochs)
-            validation_results = self.validate(validation_instances, metrics, iteration=iteration)
-            if writer is not None:
-                step = self.step_base + (iteration + 1) * self.options.train_epochs
-                self.on_iter_end(step, writer)
-                for key, value in validation_results.iteritems():
-                    tag = 'val/' + key.split('.', 1)[1].replace('.', '/')
-                    writer.log_scalar(step, tag, value)
+                           step=self.step_base + iteration * self.options.train_epochs,
+                           validate_fn=lambda i: self.validate_and_log(validation_instances,
+                                                                       metrics, writer,
+                                                                       iteration=i))
 
         self.step_base += self.options.train_iters * self.options.train_epochs
         writer.flush()
         progress.end_task()
+
+    def validate_and_log(self, validation_instances, metrics, writer, iteration):
+        validation_results = self.validate(validation_instances, metrics, iteration=iteration)
+        if writer is not None:
+            step = self.step_base + (iteration + 1) * self.options.validation_period
+            self.on_iter_end(step, writer)
+            for key, value in validation_results.iteritems():
+                tag = 'val/' + key.split('.', 1)[1].replace('.', '/')
+                writer.log_scalar(step, tag, value)
 
     def on_iter_end(self, step, writer):
         pass

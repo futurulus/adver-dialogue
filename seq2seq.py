@@ -12,6 +12,7 @@ from lasagne.nonlinearities import softmax
 from stanza.monitoring import progress
 from stanza.research import config, iterators
 
+from helpers import profile
 from tokenizers import TOKENIZERS
 from vectorizers import SequenceVectorizer, strip_invalid_tokens
 from neural import NeuralLearner, SimpleLasagneModel, sample
@@ -51,6 +52,9 @@ parser.add_argument('--eval_batch_size', type=int, default=16384,
 parser.add_argument('--beam_size', type=int, default=1,
                     help='The number of choices to keep in memory at each time step '
                          'during prediction. Only used for recurrent speakers.')
+parser.add_argument('--max_seq_len', type=int, default=50,
+                    help='The maximum length of sequences (input and output) during training.'
+                         'Use zero or negative for no limit.')
 parser.add_argument('--optimizer', choices=OPTIMIZERS.keys(), default='rmsprop',
                     help='The optimization (update) algorithm to use for speaker training.')
 parser.add_argument('--learning_rate', type=float, default=0.1,
@@ -73,6 +77,7 @@ class Seq2SeqLearner(NeuralLearner):
         super(Seq2SeqLearner, self).__init__(id=id)
         self.seq_vec = SequenceVectorizer(unk_threshold=self.options.unk_threshold)
 
+    @profile
     def predict(self, eval_instances, random=False, verbosity=0):
         result = []
         batches = iterators.gen_batches(eval_instances, self.options.eval_batch_size)
@@ -123,7 +128,7 @@ class Seq2SeqLearner(NeuralLearner):
                     assert probs.shape[1] == p.shape[1], (probs.shape[1], p.shape[1])
                     assert probs.shape[2] == len(self.seq_vec.tokens), (probs.shape[2],
                                                                         len(self.seq_vec.tokens))
-                    scores = np.log(probs)[:, length - 1, :].reshape((beam.shape[0], beam.shape[1],
+                    scores = np.log(probs[:, length - 1, :]).reshape((beam.shape[0], beam.shape[1],
                                                                       probs.shape[2]))
                     beam_search_step(scores, length, beam, beam_scores, done, eos_index)
             outputs = self.seq_vec.unvectorize_all(beam[:, 0, :])
@@ -133,6 +138,7 @@ class Seq2SeqLearner(NeuralLearner):
 
         return result
 
+    @profile
     def score(self, eval_instances, verbosity=0):
         result = []
         batches = iterators.gen_batches(eval_instances, self.options.eval_batch_size)
@@ -164,13 +170,25 @@ class Seq2SeqLearner(NeuralLearner):
         return result
 
     def init_vectorizers(self, training_instances):
+        if self.options.verbosity >= 2:
+            print('Initializing vectorizer')
         tokenize, detokenize = TOKENIZERS[self.options.tokenizer]
-        tokenized = [['<s>'] + tokenize(inst.output) + ['</s>']
-                     for inst in training_instances]
-        self.seq_vec.add_all(tokenized)
-        unk_replaced = self.seq_vec.unk_replace_all(tokenized)
-        config.dump(unk_replaced, 'unk_replaced.train.jsons', lines=True)
+        if self.options.verbosity >= 1:
+            progress.start_task('Instance', len(training_instances))
+        for i, inst in enumerate(training_instances):
+            if self.options.verbosity >= 1:
+                progress.progress(i)
+            tokenized = ['<s>'] + tokenize(inst.output) + ['</s>']
+            self.seq_vec.add(tokenized)
+        progress.end_task()
+        if self.options.verbosity >= 4:
+            print('Max sequence len: {}'.format(self.seq_vec.max_len))
+        if self.options.max_seq_len > 0 and self.seq_vec.max_len > self.options.max_seq_len:
+            self.seq_vec.max_len = self.options.max_seq_len
+            if self.options.verbosity >= 4:
+                print('  (capped to {})'.format(self.options.max_seq_len))
 
+    @profile
     def data_to_arrays(self, training_instances, test=False):
         tokenize, detokenize = TOKENIZERS[self.options.tokenizer]
 
@@ -231,6 +249,8 @@ class Seq2SeqLearner(NeuralLearner):
         self.model = model_class(input_vars, [target_var], self.l_out, id=self.id,
                                  loss=self.masked_loss(input_vars),
                                  optimizer=OPTIMIZERS[self.options.optimizer],
+                                 monitor_period=self.options.monitor_period,
+                                 validation_period=self.options.validation_period,
                                  learning_rate=self.options.learning_rate)
 
     def get_l_out(self, input_vars):
