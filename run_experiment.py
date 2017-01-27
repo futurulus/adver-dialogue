@@ -68,13 +68,15 @@ def main():
     source = datasets.SOURCES[options.data_source]
     SG = iterators.SizedGenerator
 
+    if not hasattr(options, 'verbosity') or options.verbosity >= 2:
+        print('Pre-calculating dataset sizes')
     train_data = SG(lambda: islice(source.train_data(), 0, options.train_size), length=None)
     if not hasattr(options, 'verbosity') or options.verbosity >= 4:
         print('Training set size: {}'.format(len(train_data)))
 
     validation_data = None
     if source.validation_data is not None:
-        validation_data = SG(lambda: islice(source.validation_data(), 0, options.train_size),
+        validation_data = SG(lambda: islice(source.validation_data(), 0, options.validation_size),
                              length=None)
         if not hasattr(options, 'verbosity') or options.verbosity >= 4:
             print('Validation set size: {}'.format(len(validation_data)))
