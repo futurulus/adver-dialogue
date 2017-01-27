@@ -6,9 +6,10 @@
 activate
 
 # Output directories
-runs/
+runs
 .coverage
 coverage_report/
 
 # Data files (for copyright; append _free to free data files)
 *.data
+*.jsons.gz
